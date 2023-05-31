@@ -1,0 +1,446 @@
+---
+title: "time-series_projet"
+author: "Florent GIAUNA et Zewei LIN"
+date: "2022-12-02"
+output: html_document
+---
+
+### Paramétrage de l'environnement de travail
+
+```{r}
+#Import des librairies utilisées
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(tseries)
+library(forecast)
+library(TTR)
+
+#Définition du répertoire de travail
+path = "/home/utilisateur/Documents/Computer Science/ML/M1/time_series/time-series_projet/Dataset"
+```
+
+### **1. Examine your data**
+
+```{r}
+#Chargement du fichier day.csv et transformation en dataframe
+data_day <- read.csv(file = paste(path, "/day.csv", sep=""))
+df_data_day <- data.frame(data_day)
+
+#Conversion de la variable date en format date
+df_data_day$dteday <- as.Date(data_day$dteday)
+
+#Renommage des saisons
+df_data_day$season <- factor(format(df_data_day$season, format="%A"),
+                          levels = c("1", "2","3","4"), 
+                          labels = c("Printemps", "Eté", "Automne", "Hiver"))
+
+#Création de nouvelles variables numériques dé-normalisées pour faciliter l'interprétation
+denormalize <- function(x, minval, maxval) {
+  return (x*(maxval-minval) + minval)}
+df_data_day$true_temp <- Map(denormalize, df_data_day$temp, -8, 39)
+df_data_day$true_temp <- df_data_day$temp*41
+df_data_day$true_atemp <- df_data_day$atemp*50
+df_data_day$true_windspeed <- df_data_day$windspeed*67
+df_data_day$true_hum <- df_data_day$hum*100
+
+#Visualisation et résumé statistique
+head(df_data_day)
+summary(df_data_day)
+```
+
+#### *How do the temperatures change across the seasons? What are the mean and median temperatures?*
+
+```{r}
+g1 <- ggplot(df_data_day, aes(x=season, y=true_temp)) + 
+  geom_boxplot()
+g1 + ggtitle("Boxplots des températures par saison") +
+  xlab("Saison") + ylab("Température (°C)")
+```
+
+La période la plus chaude correspond à l'automne et la plus froide au printemps.
+
+#### *What are the mean and median temperatures?*
+
+```{r}
+mean(df_data_day$true_temp)
+median(df_data_day$true_temp)
+```
+
+La température moyenne est de 20,3°C (0,495° normalisé) et la température médiane est de 20,4°C (0,498° normalisé).
+
+#### *Is there a correlation between the temp/atemp/mean.temp.atemp and the total count of bike rentals?*
+
+```{r}
+#Visualisation de la variable count par rapport à la variable temp
+g2 <- ggplot(df_data_day, aes(true_temp, cnt)) +
+  geom_point() +
+  geom_smooth()
+g2 + ggtitle("Locations en fonction de la température") +
+  xlab("Température (°C)") + ylab("Nombre de locations")
+
+#Visualisation de la variable count par rapport à la variable atemp
+g3 <- ggplot(df_data_day, aes(true_atemp, cnt)) +
+  geom_point() +
+  geom_smooth()
+g3 + ggtitle("Locations en fonction de la température ressentie") +
+  xlab("Température ressentie (°C)") + ylab("Nombre de locations")
+
+#Création de la variable mean_true_temp_atemp (moyenne quotidienne de la température et de la température ressentie)
+df_data_day$mean_true_temp_atemp <- rowMeans(select(df_data_day, c(true_temp, true_atemp)))
+
+#Visualisation de la variable count par rapport à la variable mean_true_temp_atemp
+g4 <- ggplot(df_data_day, aes(mean_true_temp_atemp, cnt)) +
+  geom_point() +
+  geom_smooth()
+g4 + ggtitle("Locations en fonction de la température moyenne \n (réelle et ressentie)") +
+  xlab("Température moyenne (°C)") + ylab("Nombre de locations")
+```
+
+D'après les nuages de points il semble exister une relation positive entre le nombre de locations et la température jusqu'à ce que les températures soient trop chaudes, au delà de 30°C environ. La relation devient alors négative.
+
+```{r}
+#Calcul des coefficients de corrélation
+print(c("R2 locations/température:", cor(df_data_day$true_temp, df_data_day$cnt)))
+print(c("R2 locations/temp. ressentie:", cor(df_data_day$atemp, df_data_day$cnt)))
+print(c("R2 locations/temp. moyenne:", cor(df_data_day$mean_true_temp_atemp, df_data_day$cnt)))
+```
+
+Les corrélations sont toutes d'environ 0,63. Ces variables sont donc corrélées.
+
+#### *What are the mean temperature, humidity, windspeed and total rentals per months?*
+
+```{r}
+df_data_day %>%
+  group_by(data_day$mnth) %>%
+  summarise_at(vars(true_temp, true_hum, true_windspeed, cnt), 
+               list(mean = mean))
+```
+
+#### *Is temperature associated with bike rentals (registered vs casual)?*
+
+```{r}
+model_registered <- lm(registered~true_temp, data = df_data_day)
+print(c("R2 for bike rentals registered:", summary(model_registered)$r.squared))
+model_casual <- lm(casual~true_temp, data = df_data_day)
+print(c("R2 for bike rentals casual:", summary(model_casual)$r.squared))
+model_ttl <- lm(cnt~true_temp, data = df_data_day)
+print(c("R2 for bike rentals total:", summary(model_ttl)$r.squared))
+```
+
+```{r}
+#Affichage des résultats du modèle complet (registered et casual)
+summary(model_ttl)
+plot(model_ttl, col = "green")
+```
+
+Il y a un lien car la p-value est inférieure à 5% et donc l'hypothèse nulle doit être rejeté mais ce lien est faible. En effet la variable température explique moins de 40% (R2 = 0,39) des locations. D'autres variables doivent être prises en compte dans le modèle.
+
+#### *In the following, we you build a predictive model ff the number of bike sharing by day (daily variable names \_\_cnt\_)*
+
+#### *Plot the cnt vs dteday and examine its patterns and irregularities*
+
+```{r}
+g5 <- ggplot(df_data_day, aes(dteday, cnt)) + 
+  geom_point() +
+  geom_smooth(method=lm)
+g5 + ggtitle("Locations en fonction de la date") +
+  xlab("Date") + ylab("Nombre de locations")
+```
+
+Il y a une tendance générale avec une croissance entre début 2011 et fin 2012. Il y a également une saisonalité : on remarque une hausse des locations durant l'été et l'automne et une baisse durant l'hiver et le printemps.
+
+#### *Clean up any outliers or missing values if needed*
+
+```{r}
+#Recherche des outliers dans la variable cnt
+boxplot.stats(df_data_day$cnt)$out
+
+#Recherche des valeurs NA et Null
+sum(is.na(df_data_day))
+is.null(df_data_day)
+```
+
+Il n'y a ni outliers, ni valeurs NA, ni valeurs Null
+
+### **2. Now you will be using the smoothed version of cnt: choose the smoothing method and justify your choice.**
+
+#### *Add the right frequency to your smoothed time series et justify your choices*
+
+```{r}
+#Création d'un time series
+ts_cnt <- ts(df_data_day$cnt, start=c(2011,1), end=c(2013,1), frequency=365)
+```
+
+Nous travaillons avec données quotidiennes entre le 01/01/2011 (start=c(2011,1)) et le 31/12/2012 (end=c(2013,1)), le paramètre frequency doit donc être défini sur 365 (365 jours de l'année).
+
+```{r}
+#Choix de la méthode de lissage
+ts_cnt_HW <- HoltWinters(ts_cnt)
+```
+
+La moyenne mobile ne prend pas en compte les tendances et les saisonnalités. Or nos données en comporte. La méthode de lissage exponentiel de Holt-Winters a des paramètres permettant de les prendre en compte et est donc plus adaptée.
+
+#### *What could you tell about this new time series in term of stationarity and seasonality? Justify your conclusions.*
+
+```{r}
+plot(ts_cnt_HW)
+plot(fitted(ts_cnt_HW))
+```
+
+La décomposition de la série temporelle permet d'estimer les effets de la tendance et de la saisonnalité. Sur le graphique on voit que la tendance a été retirée et la saisonalité a été atténuée.
+
+### **3 Could you model the smoothed time series using ARIMA model?**
+
+```{r}
+#Affichage de l'ACF et de la PACF
+ts_cnt_HW_fitted <- as.data.frame(fitted(ts_cnt_HW))
+ts_cnt_HW_val <- ts_cnt_HW_fitted$xhat
+ggtsdisplay(ts_cnt_HW_val)
+```
+
+La PACF décroit rapidement ce qui suggère un modèle MA(q). Mais sur l'ACF de trop nombreuses valeurs se suivent en dehors de l'intervalle de confiance. Il faut différencier la série car elle n'est pas stationaire.
+
+```{r}
+#Vérification du nombre de différenciation nécessaire
+ndiffs(ts_cnt_HW_val)
+```
+
+Il faut différencier la série une fois.
+
+```{r}
+#Différentiation
+ts_cnt_HW_diff <- diff(ts_cnt_HW_val)
+plot(ts_cnt_HW_diff)
+```
+
+Le bruit est réparti aléatoirement autour de 0.
+
+```{r}
+#Nouvel affichage de l'ACF et de la PACF
+ggtsdisplay(ts_cnt_HW_diff)
+```
+
+Cette fois l'ACF décroit rapidement, ce qui suggère un modèle AR(p) avec p = 5.
+
+```{r}
+#Réalisation du test Augmented Dickey-Fuller afin d'obtenir des informations plus précises
+adf.test(ts_cnt_HW_diff, alternative="stationary")
+```
+
+La p-value est inférieure à 0,05 ce qui indique que la série est stationaire. Après différenciation nous avons donc un modèle AR(5).
+
+```{r}
+ts_cnt_HW_arima <- arima(ts_cnt_HW_diff, order=c(5,0,0))
+ts_cnt_HW_arima
+```
+
+Avec 5 paramètres, ce modèle est complexe. Il faut en chercher un autre qui l'est moins.
+
+### **4. Forecasting with ARIMA Models**
+
+#### *I-Fit an ARIMA model on de-seasonal cnt (remove the season of cnt before fitting the model)*
+
+```{r}
+#Retrait de l'effet de la saison
+ts_cnt_stl <- stl(ts_cnt,"periodic")
+ts_cnt_season_adj <- seasadj(ts_cnt_stl) 
+plot(ts_cnt_season_adj)
+```
+
+On constate qu'il n'y a plus de saisonnalité mais qu'il reste une tendance.
+
+```{r}
+#Vérification du nombre de différenciation nécessaire
+ndiffs(ts_cnt_season_adj)
+```
+
+Il faut différencier la série une fois.
+
+```{r}
+#Différentiation
+ts_cnt_season_adj_diff <- diff(ts_cnt_season_adj)
+plot(ts_cnt_season_adj_diff)
+```
+
+L'effet de la tendance a été retiré.
+
+```{r}
+#Nouveau test Augmented Dickey-Fuller
+adf.test(ts_cnt_season_adj_diff)
+```
+
+La p-value est plus petite que 0,05, la série est donc stationnaire.
+
+#### *II-Fit an ARIMA with Auto-ARIMA*
+
+```{r}
+#Auto-ARIMA
+ts_cnt_auto_arima <- auto.arima(ts_cnt_season_adj)
+ts_cnt_auto_arima
+```
+
+L'auto-arima a trouvé un modèle de paramètres 1,1,1
+
+```{r}
+#Affichage des résidus
+tsdisplay(ts_cnt_auto_arima$residuals, lag=20)
+```
+
+Il y a plusieurs valeurs hors de l'intervalle de confiance, donc qui ne sont pas du bruit blanc et non expliquée par le modèle.
+
+```{r}
+#Test de Shapiro
+shapiro.test(ts_cnt_auto_arima$residuals)
+```
+
+En effet, le résultat du test de Shapiro indique que les résidus ne suivent pas une distribution normale (la p value est plus petite que 0,05). Il reste donc de l'information non traitée par le modèle.
+
+```{r}
+#Test de Ljung-Box
+Box.test(ts_cnt_auto_arima$residuals, type="Ljung-Box")
+```
+
+Toutefois d'après le test de Ljung-Box, les résidus ne sont pas auto-corrélés (la p-value est plus grande que 0,05).
+
+#### *III-Evaluate and iterate*
+
+Le modèle auto-ARIMA ayant peu de paramètres, un modèle plus complexe pourrait expliquer d'avantage les informations restées dans le bruit. Nous allons évaluer 100 modèles en testant différentes valeurs pour les paramètres p et q afin de rechercher le modèle qui minimise le score AIC.
+
+##### *Compare model errors and fit criteria*
+
+```{r warning=FALSE}
+#Itération sur les paramètres p et q entre 0 et 9 
+aic.values <- c()
+for (p in (0:9)){
+  for (q in (0:9)){
+    ts_cnt_season_adj_arima <- arima(ts_cnt_season_adj, order = c(p,1,q), method="ML")
+    aic.values <- c(aic.values, ts_cnt_season_adj_arima$aic)    
+    
+  }
+
+}
+
+#Modèle ayant le plus petit AIC
+print(c("Modèle avec le plus petit AIC:", which.min(aic.values)))
+
+#Valeur de son AIC
+print(c("Valeur de l'AIC la plus basse:", aic.values[98]))
+```
+
+Le modèle qui minimise l'AIC est donc un modèle ARIMA d'ordre (9,1,7).
+
+```{r}
+#Création du modèle de paramètres p = 9 et q = 8.
+ts_cnt_season_adj_arima <- arima(ts_cnt_season_adj, order = c(9,1,7), method="ML")
+
+#Affichage du modèle
+ts_cnt_season_adj_arima
+
+#Affichage des résidus
+tsdisplay(ts_cnt_season_adj_arima$residuals, lag=20)
+```
+
+On constate que si ce modèle optimisé a un AIC plus petit que le modèle auto-ARIMA (respectivement 11431.73 et 11496.75), la différence n'est pas grande et ce modèle n'explique pas mieux les résidus. En revanche ce modèle est beaucoup plus complexe que le modèle auto-ARIMA de paramètres 1,1,1. Il est donc préférable de continuer avec le modèle auto-ARIMA pour éviter l'overfitting.
+
+##### *Calculate forecast using the chosen model*
+
+```{r}
+#Prédictions sur 30 jours avec le modèle auto-ARIMA
+plot(forecast(ts_cnt_auto_arima, h=30))
+```
+
+##### *Plot both the original and the forecasted time series*
+
+```{r}
+#Original
+plot(ts_cnt_season_adj, col="red")
+legend(x="bottomright", legend=c("Original", "Fitted"), col=c("red", "blue"), lty=1:2, cex=0.6)
+
+#Forecasted
+lines(fitted(ts_cnt_auto_arima), col="blue")
+```
+
+Les prédictions sont plutôt fidèles. Les gros pics ont été lissés.
+
+#### *IV Forecasting*
+
+##### *Split the data into training and test times series*
+
+```{r}
+end_time = time(ts_cnt_season_adj)[700]
+train_set <- window(ts_cnt_season_adj, end=end_time)
+test_set <- window(ts_cnt_season_adj, start=end_time)
+```
+
+##### *Fit an Arima model, manually and with Auto-Arima on the training part*
+
+```{r}
+#Initialisation du modèle ARIMA (9,1,7)
+manual_fit <- Arima(train_set, order=c(9, 1, 7))
+manual_forecast <- forecast(manual_fit, h=30)
+
+#Calcul de la précision du modèle
+print(paste("Précision (RMSE) du modèle manuel: ",
+            accuracy(manual_forecast, test_set)[2,"RMSE"]))
+
+#Initialisation d'un modèle avec auto-ARIMA
+auto_fit <- auto.arima(train_set, seasonal=FALSE)
+auto_forecast <- forecast(auto_fit, h=30)
+
+#Calcul de la précision du modèle
+print(paste("Précision (RMSE) du modèle auto-ARIMA: ", 
+            accuracy(auto_forecast, test_set)[2,"RMSE"]))
+```
+
+```{r}
+#Affichage et comparaison des résultats
+plot(ts_cnt_season_adj, col="black", main = "Comparaison des différents modèles")
+legend(x="bottomright", legend=c("Données", "Modèle manuel", "Modèle auto"), col=c("black", "red", "green"), lty=1:2, cex=0.6)
+lines(fitted(manual_fit), col="red")
+lines(fitted(auto_fit), col="green")
+```
+
+D'après la mesure RMSE et comme l'indique le graphique, le modèle ARIMA de paramètres (9,1,7) minimise d'avantage les erreurs que le modèle manuel.
+
+##### Forecast the next 25 observation and plot the original ts and the forecasted one
+
+```{r}
+#Rappel de la précision du modèle manuel
+print("Précision du modèle manuel:")
+accuracy(manual_forecast)
+
+#Rappel de la précision du modèle auto-ARIMA
+print("Précision du modèle auto-ARIMA:")
+accuracy(auto_forecast)
+
+#Rappel de la précision du modèle Holt-Winters
+print("Précision du modèle Holt-Winters:")
+accuracy(ts_cnt_HW_arima)
+```
+
+La comparaison des scores nous encourage à utiliser le modèle manuel, plutôt que le modèle auto-ARIMA ou Holt-Winters. Par exemple le RMSE du modèle manuel est d'environ 599 contre 636 pour le modèle auto et 1009 pour le modèle Holt-Winters, ces derniers se trompent donc davantage.
+
+```{r}
+#Prédictions sur 25 jours avec le modèle auto-ARIMA
+plot(forecast(auto_forecast, h=25))
+
+#Prédictions sur 25 jours avec le modèle manuel (9,1,7)
+plot(forecast(manual_forecast, h=25))
+```
+
+```{r}
+#Test de Shapiro
+shapiro.test(manual_forecast$residuals)
+
+#Test de Ljung-Box
+Box.test(manual_forecast$residuals, type="Ljung-Box")
+```
+
+Le résultat du test de Shapiro indique que les résidus ne suivent pas une distribution normale (la p value est plus petite que 0,05). Toutefois d'après le test de Ljung-Box, les résidus ne sont pas auto-corrélés (la p-value est plus grande que 0,05). Comme vu précédemment il y a encore de l'information contenue dans le bruit qui n'est pas expliquée par notre modèle.
+
+Bien que le RMSE du modèle manuel soit meilleur que celui du modèle auto-ARIMA, le modèle manuel est en revanche beaucoup plus complexe puisqu'il est de paramètres 9,1,7 contre 1,1,1. L'amélioration du RMSE apporté par tous ces paramètres supplémentaires ne vaut sans doute pas le coup par rapport à la complexité ajoutée et aux ressources de calcul nécessaires. De plus ce modèle risque plus probablement l'overfitting. Il vaudrait donc mieux utiliser le modèle auto-ARIMA.
+
+Toutefois avec ces deux modèles, une partie de l'information reste contenue dans les résidus. Afin d'améliorer notre modèle de prédiction nous pourrions tester un modèle permettant de prendre en compte plusieurs saisonnalités (ici nous avons au moins des saisonnalités de semaine en plus des années). La fonction tbats() du package forecast le permet.
+
+Une autre option serait d'inclure d'autres variables. Ceci peut être fait avec une régression. Une régression dynamique permettrait également de prendre en compte l'erreur et de la considérer comme une variable à expliquer et non comme un bruit comme dans une régression classique. La technique de stepwise regression pourra ensuite être utilisée pour sélectionner le modèle offrant le meilleur équilibre entre complexité et précision.
